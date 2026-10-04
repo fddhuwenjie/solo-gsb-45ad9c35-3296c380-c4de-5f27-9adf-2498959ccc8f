@@ -66,6 +66,14 @@
   gap / jump / stuck、开放剂量未越限且无未结处置单时，才固化包含各项证据
   摘要的**合规凭证**；任一失败返回逐件原因且**不写入**；同一 `request_key`
   仅在规范化输入与当时摘要一致时重放，否则 **409**。
+- 支持**跨盘点轮次的馆藏区域交接**：提交展品 ID（可用别名）、来源及接收
+  `round_id` 与两端区域，服务在**一个 SQLite 写事务**内核验两轮已固化、
+  起始时间递增、展品列在两轮预期清单且在各轮明确定位于所报区域（缺失 /
+  错位 / 位置不明均不得交接）；首次交接以来源轮建链，此后只能从上一笔的
+  接收轮和区域续接，旧轮次不能回填覆盖当前去向；并发交接最多一笔生效，
+  失败不留半笔记录；每笔交接固化两轮摘要，可按展品查询当前区域与按轮次
+  时间排序的交接历史；归并后单侧已有的交接链仍可用目标 ID 或别名查询，
+  两侧均有交接链时拒绝归并且不改动任何记录。
 - 提供**可验证的 SQLite 在线快照**：`sqlite3.Connection.backup` 热备生成
   事务一致副本（临时文件 → SHA-256 + 清单 → 原子重命名发布），支持
   创建 / 列表 / 下载，并可在独立只读连接上核对哈希、执行
@@ -122,6 +130,8 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | POST | `/merges/commit` | 按令牌与裁决提交归并（单事务，令牌可重放） |
 | POST | `/inventory-rounds/{round_id}/reconcile` | 执行 RFID 盘点对账并固化（摘要绑定，重放/409） |
 | GET | `/inventory-rounds/{round_id}` | 取回已固化的盘点对账结果（未对账 → 404） |
+| POST | `/exhibits/{id}/zone-handovers` | 跨盘点轮次的馆藏区域交接：单事务核验并固化（链式续接；request_key 幂等，重放/409） |
+| GET | `/exhibits/{id}/zone-handovers` | 当前区域与按轮次时间排序的交接历史（别名自动解析） |
 | POST | `/evacuation-plan` | 展品应急撤离编排（时变最早到达、容量等待、封闭绕行；纯只读） |
 | POST | `/snapshots` | 创建 SQLite 在线快照（事务一致；并发仅一个，其余 409） |
 | GET | `/snapshots` | 列出已发布快照（失败 / 未完成文件不出现） |
@@ -1374,6 +1384,141 @@ curl -s http://localhost:8000/inventory-rounds/ROUND-2026-09-21-01
 - 对账不写 `readings`、不写 `ingest_receipts`：照度读数与存证收据链
   （含哈希）在对账前后完全一致，对账也不需要/不触发收据链变化。
 
+## 跨盘点轮次的馆藏区域交接
+
+`POST /exhibits/{id}/zone-handovers` 把一件展品的馆藏区域归属从一个盘点
+轮次交接到另一个轮次，形成**链式交接记录**：首次交接以来源轮建链，此后
+每笔交接只能从上一笔的**接收轮和区域**续接，旧轮次不能回填覆盖当前去向。
+`GET /exhibits/{id}/zone-handovers` 返回**当前区域**（链尖的接收轮次与
+区域）与**按轮次时间排序**的交接历史。
+
+### 核验口径（全部在同一个 SQLite 写事务内）
+
+- 展品 ID 先经归并别名解析为规范档案（不存在 → **404**）；
+- 来源与接收两轮都必须**已固化**（未对账 → **404**），且来源轮次起始时刻
+  **早于**接收轮次（起始时间递增；倒退或相同 → **422**，两轮相同 → 422）；
+- 展品须列在**两轮**预期清单中，并在各轮**明确定位于所报区域**：
+  缺失 / 错位 / 位置不明 / 不在预期清单（含意外出现）均不得交接（**409**）；
+- **链式续接**：已有交接链时，本次（来源轮次, 来源区域）必须等于链尖的
+  （接收轮次, 接收区域），否则 **409**——旧轮次不能回填覆盖当前去向；
+- 核验证据与写入在同一 `BEGIN IMMEDIATE` 事务内完成：任一失败整体回滚、
+  **不留半笔记录**（`request_key` 不占用）；并发交接由写锁串行化，
+  **最多一笔生效**（竞争方得到 409 或按 `request_key` 回放）。
+
+### 固化、幂等与归并
+
+- 每笔交接**固化两轮摘要**（`from_round_digest` / `to_round_digest`）与
+  两轮起始时刻，记录落库后绝不改写；
+- `request_key` 为幂等键：同键同目标（同一规范档案、同一对轮次与两端
+  区域）重放首次结果（`already_committed=true`），换目标 → **409**；
+- 交接记录按写入时的规范档案 ID 落库，**归并后不改写**；查询经别名闭包
+  （规范 ID + 全部别名）取链——归并后**单侧已有的交接链**仍可用目标 ID
+  或别名查询，链也可以从既有链尖继续续接；**两侧均有交接链**时归并被
+  拒绝（**409**）且不改动任何记录（两侧去向不会静默合并）；
+- 交接**只写 `zone_handovers`**：原盘点结果、照度读数与存证收据链保持
+  不变。
+
+### 29. 提交首次交接
+
+```bash
+# 前置：EX-101 已在 R1（预期并定位于 A区展柜）与 R2（预期并定位于 B区展柜）
+# 两轮中完成对账固化，且 R1 起始时刻早于 R2
+curl -s -X POST http://localhost:8000/exhibits/EX-101/zone-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "handover-EX101-2026-10-01",
+    "from_round_id": "ROUND-2026-09-30-01",
+    "to_round_id":   "ROUND-2026-10-01-01",
+    "from_area": "A区展柜",
+    "to_area":   "B区展柜"
+  }'
+```
+
+```json
+{
+  "handover_id": "6d1f…",
+  "request_key": "handover-EX101-2026-10-01",
+  "requested_id": "EX-101", "canonical_id": "EX-101",
+  "from_round_id": "ROUND-2026-09-30-01", "to_round_id": "ROUND-2026-10-01-01",
+  "from_area": "A区展柜", "to_area": "B区展柜",
+  "from_round_digest": "a3f1…", "to_round_digest": "b7c2…",
+  "from_round_start_at": "2026-09-30T08:00:00Z",
+  "to_round_start_at": "2026-10-01T08:00:00Z",
+  "prev_handover_id": null,
+  "created_at": "2026-10-01T09:00:00.000Z",
+  "already_committed": false
+}
+```
+
+相同 `request_key` + 相同目标重放返回首次结果（`already_committed=true`）；
+同键换展品 / 轮次 / 区域 → **409**。
+
+### 30. 链式续接与当前区域
+
+```bash
+# 续接：来源轮次/区域必须等于上一笔的接收轮次/区域
+curl -s -X POST http://localhost:8000/exhibits/EX-101/zone-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "handover-EX101-2026-10-02",
+    "from_round_id": "ROUND-2026-10-01-01",
+    "to_round_id":   "ROUND-2026-10-02-01",
+    "from_area": "B区展柜",
+    "to_area":   "C区库房"
+  }'
+
+# 当前区域 + 按轮次时间排序的交接历史
+curl -s http://localhost:8000/exhibits/EX-101/zone-handovers
+```
+
+```json
+{
+  "requested_id": "EX-101", "canonical_id": "EX-101",
+  "current": {
+    "round_id": "ROUND-2026-10-02-01", "area": "C区库房",
+    "handover_id": "9e2a…",
+    "round_start_at": "2026-10-02T08:00:00Z"
+  },
+  "handovers": [
+    {"handover_id": "6d1f…", "from_round_id": "ROUND-2026-09-30-01",
+     "to_round_id": "ROUND-2026-10-01-01",
+     "from_area": "A区展柜", "to_area": "B区展柜",
+     "prev_handover_id": null, "…": "…"},
+    {"handover_id": "9e2a…", "from_round_id": "ROUND-2026-10-01-01",
+     "to_round_id": "ROUND-2026-10-02-01",
+     "from_area": "B区展柜", "to_area": "C区库房",
+     "prev_handover_id": "6d1f…", "…": "…"}
+  ]
+}
+```
+
+- 续接不匹配链尖（来源轮次/区域不是上一笔的接收轮次/区域）→ **409**，
+  例如链尖已在 `ROUND-2026-10-02-01` 时再提交从 `ROUND-2026-09-30-01`
+  出发的旧轮次交接（回填）；
+- 尚无交接记录的展品：`current` 为 `null`、`handovers` 为空列表；
+- 错误码小结：展品不存在 → 404；轮次未固化 → 404；同一轮次或起始时间不
+  递增 → 422；未列入预期清单 / 缺失 / 错位 / 位置不明 / 所报区域与轮次
+  预期不符 / 链尖续接不符 / `request_key` 换目标 → 409。
+
+### 31. 归并与交接链
+
+```bash
+# 仅来源侧有交接链：归并照常；链仍可用目标 ID 或别名查询
+curl -s -X POST http://localhost:8000/merges/preview \
+  -H 'Content-Type: application/json' -d '{"source_id": "DUP-101", "target_id": "EX-101"}'
+curl -s -X POST http://localhost:8000/merges/commit \
+  -H 'Content-Type: application/json' -d '{"token": "<token>", "resolutions": []}'
+
+curl -s http://localhost:8000/exhibits/EX-101/zone-handovers   # 目标 ID 查询
+curl -s http://localhost:8000/exhibits/DUP-101/zone-handovers  # 别名查询，结果相同
+
+# 两侧均有交接链时提交归并 → 409，且不改动任何记录
+# {"detail": "来源与目标两侧都存在馆藏区域交接链，归并被拒绝：…"}
+```
+
+归并不改写交接记录（历史条目保持写入时的规范档案 ID）；归并后用目标 ID
+或别名重放同一 `request_key` 仍命中首次固化的那笔交接。
+
 ## 展品应急撤离编排
 
 `POST /evacuation-plan` 为一批展品编排应急撤离的**出口、路径与逐段时序**。
@@ -1680,13 +1825,14 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── calendar.py  # 展陈开放日历：每周规则 + 日期例外展开、跨午夜、夏令时边界解析
 │   ├── merge.py     # 重复档案归并：预演、版本令牌、单事务提交、永久别名、归并前收据链校验、来源配置合并
 │   ├── inventory.py # RFID 盘点对账：固定窗口最高 RSSI 定位、信号差阈值判不明、四类差异、请求摘要绑定与并发固化
+│   ├── handovers.py # 跨盘点轮次馆藏区域交接：单事务核验（轮次固化/时间递增/定位证据/链尖续接）、request_key 幂等、别名闭包取链
 │   ├── evacuation.py # 应急撤离编排：时变最早到达搜索、[进入,离开) 半开容量计数、封闭等待/绕行、路径字典序决胜（纯只读）
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
 │   ├── tickets.py   # 照度异常处置单：创建时单事务重算诊断/剂量/链尾并固化快照，结案重算核对（409 不写入）、resolved 举证
 │   ├── compliance.py # 展厅开放批次合规核验：单事务核验（盘点定位/开放剂量/诊断事件/未结处置单），全过才固化凭证，request_key 幂等
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / illumination_tickets / compliance_credentials）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / zone_handovers / reading_corrections / source_priority_versions / illumination_tickets / compliance_credentials）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
@@ -1696,6 +1842,7 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── test_receipts.py  # 照度上报存证：收据链、整链校验、并发顺序、归并保留
 │   ├── test_corrections.py # 上报批次更正：仅作废 inserted、重放/换目标 409、链/归并/归属变化 409、查询排除
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
+│   ├── test_handovers.py # 跨轮次区域交接：建链/续接/回填拒绝、定位证据、重放/换目标 409、并发唯一、归并闭包查询与双侧拒绝、隔离性
 │   ├── test_evacuation.py # 应急撤离：容量竞争、半开封闭等待/绕行、路径字典序平局、别名重复 422、无出口 422、只读隔离
 │   ├── test_tickets.py   # 照度异常处置单：快照固化与 digest、request_key 重放/换目标 409、结案核对 409、resolved 举证、并发
 │   ├── test_compliance.py # 展厅开放批次合规核验：凭证固化、逐件失败原因、重放/换目标/证据变化 409、别名、并发

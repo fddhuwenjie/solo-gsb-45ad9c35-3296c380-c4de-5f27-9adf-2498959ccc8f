@@ -1,4 +1,4 @@
-"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账、多来源读数仲裁、照度异常处置单。"""
+"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账、多来源读数仲裁、照度异常处置单、跨盘点轮次馆藏区域交接。"""
 from __future__ import annotations
 
 import json
@@ -32,6 +32,7 @@ from .db import get_conn, init_db
 from .diagnose import build_events, intersect_window, sort_events
 from .dose import compute_dose
 from .evacuation import EvacuationGraph, EvacuationGraphError, plan_evacuation
+from .handovers import commit_handover, load_history
 from .inventory import load_round, reconcile_round
 from .merge import commit_merge, create_preview, get_canonical_or_404, resolve_canonical
 from .receipts import (
@@ -92,6 +93,9 @@ from .schemas import (
     SourcePriorityVersionOut,
     TimelineEntryOut,
     TimelineOut,
+    ZoneHandoverCommitOut,
+    ZoneHandoverHistoryOut,
+    ZoneHandoverRequest,
     ensure_aware,
     format_local_time,
     parse_local_time,
@@ -117,7 +121,7 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.11.0",
+    version="1.12.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
@@ -153,7 +157,13 @@ app = FastAPI(
                 "支持展厅开放批次合规核验：单个写事务内解析别名、读取盘点轮次固化结果、"
                 "逐件重算截至窗口末的 calendar=display 剂量与完整诊断事件、检查未结处置单；"
                 "全部通过才固化含各项证据摘要的合规凭证，任一失败逐件返回原因且不写入；"
-                "request_key 仅在规范化输入与当时摘要一致时重放，否则 409。",
+                "request_key 仅在规范化输入与当时摘要一致时重放，否则 409。"
+                "支持跨盘点轮次的馆藏区域交接：单个写事务内核验两轮已固化、起始时间递增、"
+                "展品列在两轮预期清单且明确定位于所报区域（缺失/错位/位置不明不得交接），"
+                "首次交接以来源轮建链，此后只能从链尖接收轮和区域续接，旧轮次不能回填；"
+                "并发交接最多一笔生效，失败不留半笔记录；每笔交接固化两轮摘要，"
+                "提供当前区域与按轮次时间排序的交接历史；归并后单侧已有的交接链经别名"
+                "闭包仍可用目标 ID 或别名查询，两侧均有交接链时拒绝归并且不改动任何记录。",
     lifespan=lifespan,
 )
 
@@ -1198,6 +1208,55 @@ def get_inventory_round(
     if result is None:
         raise HTTPException(status_code=404, detail=f"盘点轮次不存在或尚未对账: {round_id}")
     return result
+
+
+# ---------- 跨盘点轮次的馆藏区域交接 ----------
+
+@app.post("/exhibits/{exhibit_id}/zone-handovers",
+          response_model=ZoneHandoverCommitOut, tags=["handovers"])
+def create_zone_handover(
+    exhibit_id: str,
+    payload: ZoneHandoverRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> ZoneHandoverCommitOut:
+    """跨盘点轮次的馆藏区域交接：单事务核验并固化一笔交接。
+
+    - 路径中的展品 ID 可用归并别名（自动解析到规范档案）；请求给出
+      ``request_key``、来源与接收 ``round_id`` 及两端区域；
+    - 服务在**一个 SQLite 写事务**（BEGIN IMMEDIATE）内完成全部核验并落库：
+      两轮均已固化（未对账 → 404）、来源轮次起始时刻**早于**接收轮次
+      （起始时间递增，否则 422）、展品列在两轮预期清单中且在各自轮次
+      **明确定位于所报区域**——缺失 / 错位 / 位置不明 / 不在预期清单
+      均不得交接（409）；
+    - **链式续接**：首次交接以来源轮建链；此后每笔交接的（来源轮次,
+      来源区域）必须等于链尖的（接收轮次, 接收区域），否则 409——
+      旧轮次不能回填覆盖当前去向；
+    - 核验证据与写入在同一事务内完成，任一失败整体回滚、**不留半笔记录**；
+      并发交接由写锁串行化，**最多一笔生效**（竞争方得到 409 或按
+      ``request_key`` 回放）；
+    - 每笔交接**固化两轮摘要**（``from_round_digest`` / ``to_round_digest``）
+      与起始时刻，记录落库后绝不改写；``request_key`` 为幂等键：同键同目标
+      重放首次结果（``already_committed=true``），换目标 → 409；
+    - 交接不改写盘点轮次、照度读数与存证收据链。
+    """
+    return commit_handover(conn, exhibit_id, payload)
+
+
+@app.get("/exhibits/{exhibit_id}/zone-handovers",
+         response_model=ZoneHandoverHistoryOut, tags=["handovers"])
+def get_zone_handovers(
+    exhibit_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> ZoneHandoverHistoryOut:
+    """当前区域与按轮次时间排序的交接历史；别名自动解析到规范档案。
+
+    交接记录按写入时的规范档案 ID 落库、归并后不改写；查询经别名闭包
+    （规范 ID + 全部别名）取链，因此归并后单侧已有的交接链仍可用目标 ID
+    或别名查询。``current`` 为链尖的接收轮次与区域（尚无交接记录时为
+    null）；``handovers`` 按接收轮次起始时刻升序。只读操作。
+    """
+    exhibit = get_canonical_or_404(conn, exhibit_id)
+    return load_history(conn, exhibit_id, exhibit["id"])
 
 
 # ---------- 展品应急撤离编排（纯只读计算） ----------

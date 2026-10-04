@@ -1188,3 +1188,74 @@ class ComplianceCheckOut(BaseModel):
         description="true 表示相同 request_key 且规范化输入与当时摘要一致的重放，"
                     "返回的是首次固化的凭证",
     )
+
+
+# ---------- 跨盘点轮次的馆藏区域交接 ----------
+
+class ZoneHandoverRequest(BaseModel):
+    """一次跨盘点轮次的馆藏区域交接请求（来源轮次/区域 → 接收轮次/区域）。"""
+
+    request_key: str = Field(
+        min_length=1, max_length=200,
+        description="交接幂等键：同键同目标（同一规范档案、同一对轮次与两端区域）"
+                    "重放首次结果；换目标 → 409",
+    )
+    from_round_id: str = Field(min_length=1, max_length=200,
+                               description="来源盘点轮次 ID（须已固化）")
+    to_round_id: str = Field(min_length=1, max_length=200,
+                             description="接收盘点轮次 ID（须已固化，起始时刻须晚于来源轮次）")
+    from_area: str = Field(min_length=1, max_length=100,
+                           description="来源轮次中展品明确定位的区域（交出一端）")
+    to_area: str = Field(min_length=1, max_length=100,
+                         description="接收轮次中展品明确定位的区域（接收一端）")
+
+
+class ZoneHandoverOut(BaseModel):
+    """一笔已固化的馆藏区域交接记录（落库后不可变）。"""
+
+    handover_id: str = Field(description="交接记录 ID")
+    request_key: str = Field(description="交接幂等键")
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(
+        description="写入时的规范档案 ID；归并后记录不改写，经别名闭包仍可用目标 ID 或别名查询",
+    )
+    from_round_id: str = Field(description="来源盘点轮次 ID")
+    to_round_id: str = Field(description="接收盘点轮次 ID")
+    from_area: str = Field(description="来源轮次中明确定位的区域")
+    to_area: str = Field(description="接收轮次中明确定位的区域")
+    from_round_digest: str = Field(description="来源轮次固化摘要（request_digest，SHA-256）")
+    to_round_digest: str = Field(description="接收轮次固化摘要（request_digest，SHA-256）")
+    from_round_start_at: str = Field(description="来源轮次起始时刻（UTC，ISO 8601，Z 结尾）")
+    to_round_start_at: str = Field(description="接收轮次起始时刻（UTC，ISO 8601，Z 结尾）")
+    prev_handover_id: str | None = Field(
+        description="链上上一笔交接 ID；首次交接（以来源轮建链）为 null",
+    )
+    created_at: str = Field(description="交接固化时刻（UTC，ISO 8601，Z 结尾）")
+
+
+class ZoneHandoverCommitOut(ZoneHandoverOut):
+    already_committed: bool = Field(
+        description="false 表示本次首次固化；true 表示相同 request_key 重放，返回首次结果",
+    )
+
+
+class ZoneCurrentOut(BaseModel):
+    """展品当前所在区域：交接链链尖的接收轮次与区域。"""
+
+    round_id: str = Field(description="当前所在盘点轮次（链尖接收轮次）")
+    area: str = Field(description="当前所在区域（链尖接收区域）")
+    handover_id: str = Field(description="确定当前去向的那笔交接 ID")
+    round_start_at: str = Field(description="当前轮次起始时刻（UTC，ISO 8601，Z 结尾）")
+
+
+class ZoneHandoverHistoryOut(BaseModel):
+    """一件展品的当前区域与按轮次时间排序的交接历史。"""
+
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="规范档案 ID")
+    current: ZoneCurrentOut | None = Field(
+        description="当前区域（链尖接收轮次与区域）；尚无交接记录为 null",
+    )
+    handovers: list[ZoneHandoverOut] = Field(
+        description="交接历史：按接收轮次起始时刻升序（链式续接保证与链接顺序一致）",
+    )

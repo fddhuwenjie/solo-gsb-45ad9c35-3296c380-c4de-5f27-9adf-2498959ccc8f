@@ -201,6 +201,34 @@ CREATE TABLE IF NOT EXISTS compliance_credentials (
     created_at     TEXT NOT NULL           -- 固化时刻（UTC ISO）
 );
 
+-- 跨盘点轮次的馆藏区域交接链：每笔交接在单个 BEGIN IMMEDIATE 写事务内完成
+-- 全部核验（两轮均已固化、起始时间递增、展品列在两轮预期清单且在各轮明确
+-- 定位于所报区域、从链尖续接）后落库；任一失败整体回滚，不留半笔记录。
+-- request_key 为幂等键：同键同目标重放首次结果，换目标 → 409。
+-- 与 ingest_receipts 一样故意不设外键、不级联删除、落库后绝不 UPDATE：
+-- 记录按写入时的规范档案 ID 保存，档案归并后原样保留，查询经别名闭包
+-- （规范 ID + 全部别名）取链，单侧已有的交接链仍可用目标 ID 或别名查询。
+CREATE TABLE IF NOT EXISTS zone_handovers (
+    handover_id        TEXT PRIMARY KEY,
+    request_key        TEXT NOT NULL UNIQUE,  -- 交接幂等键
+    canonical_id       TEXT NOT NULL,         -- 写入时的规范档案 ID（归并后不改写）
+    requested_id       TEXT NOT NULL,         -- 请求中使用的展品 ID（可能是别名）
+    from_round_id      TEXT NOT NULL,         -- 来源盘点轮次
+    to_round_id        TEXT NOT NULL,         -- 接收盘点轮次
+    from_area          TEXT NOT NULL,         -- 来源轮次中明确定位的区域（交出一端）
+    to_area            TEXT NOT NULL,         -- 接收轮次中明确定位的区域（接收一端）
+    from_round_digest  TEXT NOT NULL,         -- 来源轮次固化摘要（request_digest）
+    to_round_digest    TEXT NOT NULL,         -- 接收轮次固化摘要（request_digest）
+    from_round_start_s REAL NOT NULL,         -- 来源轮次起始时刻（Unix 秒，UTC）
+    to_round_start_s   REAL NOT NULL,         -- 接收轮次起始时刻（Unix 秒，UTC）
+    prev_handover_id   TEXT,                  -- 链上上一笔 handover_id；首笔为 NULL
+    result_json        TEXT NOT NULL,         -- ZoneHandoverOut 的 JSON（首次固化结果，供重放）
+    created_at         TEXT NOT NULL          -- 交接固化时刻（UTC ISO）
+);
+
+CREATE INDEX IF NOT EXISTS idx_zone_handovers_canonical
+ON zone_handovers (canonical_id);
+
 -- 多来源读数仲裁：来源优先级版本。每版携带生效时刻 effective_at 与来源
 -- 优先级列表（JSON 数组，靠前优先级更高；未列入的来源并列最低）。
 -- 版本只增不改：配置更新必须携带 expected_version（当前最新版本号），

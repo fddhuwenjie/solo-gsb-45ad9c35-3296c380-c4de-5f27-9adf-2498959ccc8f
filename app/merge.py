@@ -16,6 +16,9 @@
 - 来源优先级配置随归并合并：仅来源有才整体搬迁到目标；双方逐版本一致
   保留目标的一份；双方都有且不一致 → 409 拒绝归并，冲突绝不静默覆盖。
   配置指纹纳入预演版本令牌，预演后任一侧发布新版本同样使令牌失效。
+- 馆藏区域交接链随归并保留：仅一侧有交接链时归并照常，链记录不改写，
+  归并后经别名闭包仍可用目标 ID 或别名查询；两侧均有交接链 → 409
+  拒绝归并，不改动任何记录（两侧去向不会静默合并）。
 """
 from __future__ import annotations
 
@@ -268,8 +271,27 @@ class _PriorityConflict(Exception):
     """双方来源优先级配置不一致，归并必须 409 拒绝（冲突不静默覆盖）。"""
 
 
+class _HandoverChainConflict(Exception):
+    """来源与目标两侧都有馆藏区域交接链，归并必须 409 拒绝（不改动任何记录）。"""
+
+
 class _CommitValidation(Exception):
     """裁决不合法或不完整，422。"""
+
+
+def _closure_has_handovers(conn: sqlite3.Connection, canonical_id: str) -> bool:
+    """规范 ID + 全部别名的闭包内是否存在馆藏区域交接记录。
+
+    交接记录按写入时的规范档案 ID 落库、归并后不改写，因此一侧的交接链
+    可能挂在该侧历次归并前的任一规范 ID 下；闭包查询与交接模块的取链
+    口径一致。
+    """
+    ids = [canonical_id, *aliases_of(conn, canonical_id)]
+    marks = ",".join("?" for _ in ids)
+    return conn.execute(
+        f"SELECT 1 FROM zone_handovers WHERE canonical_id IN ({marks}) LIMIT 1",
+        ids,
+    ).fetchone() is not None
 
 
 def _validate_resolutions(
@@ -372,6 +394,15 @@ def commit_merge(conn: sqlite3.Connection, token: str,
                     f"档案 {cid} 的存证收据链校验失败：第 {failure.get('seq')} 张"
                     f"（{failure.get('reason')}），归并被拒绝"
                 )
+
+        # 馆藏区域交接链：仅一侧有才允许归并——归并后单侧已有的交接链经别名
+        # 闭包仍可用目标 ID 或别名查询；两侧都有 → 409 拒绝，事务回滚、
+        # 不改动任何记录（两侧去向不会静默合并）。
+        if _closure_has_handovers(conn, source_id) and _closure_has_handovers(conn, target_id):
+            raise _HandoverChainConflict(
+                "来源与目标两侧都存在馆藏区域交接链，归并被拒绝："
+                "两侧交接去向不会静默合并，且不改动任何记录"
+            )
 
         # 来源优先级配置合并：仅来源有才整体搬迁到目标（版本号保持）；
         # 双方一致保留目标的一份；双方都有且不一致 → 409 拒绝归并，
@@ -519,6 +550,9 @@ def commit_merge(conn: sqlite3.Connection, token: str,
         conn.rollback()
         raise HTTPException(status_code=409, detail=str(e))
     except _PriorityConflict as e:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail=str(e))
+    except _HandoverChainConflict as e:
         conn.rollback()
         raise HTTPException(status_code=409, detail=str(e))
     except _CommitValidation as e:
