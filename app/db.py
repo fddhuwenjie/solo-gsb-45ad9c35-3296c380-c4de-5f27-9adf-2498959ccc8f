@@ -201,6 +201,35 @@ CREATE TABLE IF NOT EXISTS compliance_credentials (
     created_at     TEXT NOT NULL           -- 固化时刻（UTC ISO）
 );
 
+-- 跨盘点轮次的馆藏区域交接：每件规范档案一条只增不改的交接链，seq 从 1
+-- 连续递增。一笔交接记录证据（两轮的固化 request_digest）与写入在同一个
+-- BEGIN IMMEDIATE 事务内完成；(canonical_id, source_round_id) /
+-- (canonical_id, target_round_id) 唯一索引 + 写锁保证并发交接最多一笔生效、
+-- 同一轮不能被两笔交接占用，失败事务不留半笔记录。行只 INSERT 绝不 UPDATE：
+-- 旧轮次不能回填覆盖当前去向。归并仅在单侧有链时把链整链改挂到目标规范 ID
+-- （两侧都有链则拒绝归并），因此本表保留对 exhibits / inventory_rounds 的
+-- 外键且不级联删除。
+CREATE TABLE IF NOT EXISTS area_handovers (
+    canonical_id        TEXT NOT NULL REFERENCES exhibits(id) ON DELETE RESTRICT,
+    seq                 INTEGER NOT NULL CHECK (seq >= 1),
+    source_round_id     TEXT NOT NULL,
+    target_round_id     TEXT NOT NULL,
+    source_area         TEXT NOT NULL,
+    target_area         TEXT NOT NULL,
+    source_round_digest TEXT NOT NULL,   -- 交接核验时来源轮的固化请求摘要（证据，不可变）
+    target_round_digest TEXT NOT NULL,   -- 交接核验时接收轮的固化请求摘要（证据，不可变）
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (canonical_id, seq),
+    CHECK (source_round_id <> target_round_id)
+);
+
+-- 一轮盘点在一条链中至多作为一笔交接的来源/接收方：链必须按轮次时间续接，
+-- 并发交接竞争同一续接位置时由唯一索引兜底，只有一笔能落库。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_area_handovers_source
+ON area_handovers (canonical_id, source_round_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_area_handovers_target
+ON area_handovers (canonical_id, target_round_id);
+
 -- 多来源读数仲裁：来源优先级版本。每版携带生效时刻 effective_at 与来源
 -- 优先级列表（JSON 数组，靠前优先级更高；未列入的来源并列最低）。
 -- 版本只增不改：配置更新必须携带 expected_version（当前最新版本号），

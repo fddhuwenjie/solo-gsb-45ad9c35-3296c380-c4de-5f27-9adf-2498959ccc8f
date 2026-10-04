@@ -122,6 +122,8 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | POST | `/merges/commit` | 按令牌与裁决提交归并（单事务，令牌可重放） |
 | POST | `/inventory-rounds/{round_id}/reconcile` | 执行 RFID 盘点对账并固化（摘要绑定，重放/409） |
 | GET | `/inventory-rounds/{round_id}` | 取回已固化的盘点对账结果（未对账 → 404） |
+| POST | `/exhibits/{id}/area-handovers` | 跨盘点轮次馆藏区域交接（单事务核验+固化；首次建链、只能续接，并发最多一笔生效） |
+| GET | `/exhibits/{id}/area-handovers` | 当前区域 + 按轮次时间排序的交接历史（别名自动解析） |
 | POST | `/evacuation-plan` | 展品应急撤离编排（时变最早到达、容量等待、封闭绕行；纯只读） |
 | POST | `/snapshots` | 创建 SQLite 在线快照（事务一致；并发仅一个，其余 409） |
 | GET | `/snapshots` | 列出已发布快照（失败 / 未完成文件不出现） |
@@ -524,7 +526,13 @@ curl -s 'http://localhost:8000/exhibits/<id>/dose?start=2026-09-20T00:00:00Z&end
 - 归并**保留来源与目标的既有存证收据链**（只增不改，旧哈希绝不重写），
   提交前分别校验两条链，任一断链或内容不符即 **409** 拒绝归并；归并后的
   新上报（含经来源别名）继续接入**目标原链**；响应的 `receipt_chains`
-  列出保留的链标识，可分别用 `GET /receipts/chains/{chain_id}/verify` 核查。
+  列出保留的链标识，可分别用 `GET /receipts/chains/{chain_id}/verify` 核查；
+- 跨轮区域交接链：单侧已有交接链时归并把整链**改挂**到目标（证据行不变，
+  归并后用目标 ID 或来源别名查到同一条链，响应 `handover_chain_carried=true`）；
+  **两侧都有交接链时 409 拒绝归并、不改动任何记录**——预演以
+  `area_handover_conflict=true`、`source_handover_count` /
+  `target_handover_count` 明示，交接链指纹也纳入版本令牌，预演后新增交接
+  同样使令牌失效（详见下文“跨盘点轮次的馆藏区域交接”）。
 
 ### 7. 预演冲突
 
@@ -1373,6 +1381,144 @@ curl -s http://localhost:8000/inventory-rounds/ROUND-2026-09-21-01
   视为同一展品；`expectations` 同时给出 `requested_id` 与 `canonical_id`；
 - 对账不写 `readings`、不写 `ingest_receipts`：照度读数与存证收据链
   （含哈希）在对账前后完全一致，对账也不需要/不触发收据链变化。
+
+## 跨盘点轮次的馆藏区域交接
+
+展品在两轮已固化盘点之间发生馆藏区域交接时，用
+`POST /exhibits/{id}/area-handovers` 登记一笔。交接链**只增不改**：每件展品
+一条链，链内序号从 1 连续递增，且按盘点轮次的起始时间向前续接。
+
+### 交接核验口径（全部在同一 SQLite 写事务内）
+
+- 请求体：`exhibit_id`（可用归并别名，须与路径 ID 解析到同一规范档案）、
+  来源轮 `source_round_id` 与接收轮 `target_round_id`、两端区域
+  `source_area` / `target_area`；
+- 两轮都必须**已固化对账**（任一未对账 → 404），且接收轮起始时间
+  **严格晚于**来源轮（相同或更早 → 422，不允许时间相等）；
+- 展品必须**同时列在两轮的预期清单**中，并在各轮**明确定位到所报区域**：
+  缺失（无有效事件）、错位（定位区域不同）、位置不明（最后窗口多区域信号差
+  不足阈值）或不在预期清单（意外出现）均 **409 不得交接**；所报区域与该轮
+  实际定位区域不一致同样 409；
+- **首次交接以来源轮建链**；此后每一笔的来源轮/来源区域必须与上一笔的
+  接收轮/接收区域**完全一致**才能续接。旧轮次不能回填、不能分叉、
+  不能覆盖当前去向（违反 → 409）；
+- 证据核验与写入在同一个 `BEGIN IMMEDIATE` 事务内完成：**并发交接最多一笔
+  生效**（竞争方 409），任何失败整体回滚，**不留半笔记录**；
+- 每笔交接固化两轮的请求摘要（`source_round_digest` /
+  `target_round_digest`，即盘点轮次的 `request_digest`）作为证据。
+- 交接只写交接表：原盘点结果、照度读数与存证收据链完全不变。
+
+### 29. 提交一笔交接
+
+先完成两轮盘点对账（见上文“RFID 馆藏盘点对账”），随后：
+
+```bash
+# 首次交接：展品在 r1 明确定位于 A 区，在更晚的 r2 明确定位于 B 区
+curl -s -X POST http://localhost:8000/exhibits/vase-001/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "exhibit_id": "vase-001",
+        "source_round_id": "ROUND-2026-09-01",
+        "target_round_id": "ROUND-2026-10-01",
+        "source_area": "A-常设展厅",
+        "target_area": "B-巡回展厅"
+      }'
+```
+
+```json
+{
+  "seq": 1,
+  "requested_id": "vase-001",
+  "canonical_id": "vase-001",
+  "source_round_id": "ROUND-2026-09-01",
+  "target_round_id": "ROUND-2026-10-01",
+  "source_area": "A-常设展厅",
+  "target_area": "B-巡回展厅",
+  "source_round_start_at": "2026-09-01T08:00:00Z",
+  "target_round_start_at": "2026-10-01T08:00:00Z",
+  "source_round_digest": "a3f1…",
+  "target_round_digest": "7c2e…",
+  "created_at": "2026-10-04T12:00:00.000Z"
+}
+```
+
+后续交接只能从上一笔的接收轮与区域续接（示例：从 `ROUND-2026-10-01` /
+`B-巡回展厅` 继续转到 `ROUND-2026-11-01` 的 `C-库房`）：
+
+```bash
+curl -s -X POST http://localhost:8000/exhibits/vase-001/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "exhibit_id": "vase-001",
+        "source_round_id": "ROUND-2026-10-01",
+        "target_round_id": "ROUND-2026-11-01",
+        "source_area": "B-巡回展厅",
+        "target_area": "C-库房"
+      }'
+# {"seq": 2, ... }
+```
+
+错误情形（均不写入任何记录）：
+
+```bash
+# 接收轮起始时间不晚于来源轮 → 422
+# 来源/接收轮未对账 → 404
+# 展品在任一轮缺失/错位/位置不明/未列入预期，或所报区域与定位不符 → 409
+# {"detail": "展品 vase-001 在接收轮 ROUND-2026-10-01 中缺失、错位、位置不明或未列入预期清单，不得交接"}
+
+# 从上一笔接收轮之外的旧轮回填、或来源区域与当前去向不符 → 409
+# {"detail": "交接链只能从上一笔的接收轮 ROUND-2026-10-01 续接，本次来源轮 … 不是当前去向所在轮；旧轮次不能回填覆盖当前去向"}
+```
+
+### 30. 查询当前区域与交接历史
+
+```bash
+curl -s http://localhost:8000/exhibits/vase-001/area-handovers
+```
+
+```json
+{
+  "requested_id": "vase-001",
+  "canonical_id": "vase-001",
+  "current_round_id": "ROUND-2026-11-01",
+  "current_area": "C-库房",
+  "history": [
+    {"seq": 1, "source_round_id": "ROUND-2026-09-01", "target_round_id": "ROUND-2026-10-01",
+     "source_area": "A-常设展厅", "target_area": "B-巡回展厅",
+     "source_round_start_at": "2026-09-01T08:00:00Z",
+     "target_round_start_at": "2026-10-01T08:00:00Z",
+     "source_round_digest": "a3f1…", "target_round_digest": "7c2e…",
+     "created_at": "2026-10-04T12:00:00.000Z"},
+    {"seq": 2, "source_round_id": "ROUND-2026-10-01", "target_round_id": "ROUND-2026-11-01",
+     "source_area": "B-巡回展厅", "target_area": "C-库房", "...": "..."}
+  ]
+}
+```
+
+`history` 按交接序号（即盘点轮次起始时间）升序；从未交接时
+`current_area` / `current_round_id` 为 `null`、`history` 为空数组。
+展品 ID 可用归并别名查询。
+
+### 31. 与档案归并的联动
+
+- **单侧已有交接链**时归并：来源链在归并事务内**整链改挂**到目标规范档案
+  （序号与全部证据行不变），归并提交结果 `"handover_chain_carried": true`；
+  归并后用**目标 ID 或来源别名**查询到的是同一条链、当前去向保持不变；
+- **两侧都有交接链**时拒绝归并：预演结果 `"area_handover_conflict": true`、
+  `"ready_to_commit": false`，提交 **409 且不改动任何记录**
+  （同时返回两侧笔数 `source_handover_count` / `target_handover_count`）；
+- 预演后任一侧新增交接会使预演令牌过期，提交 409。
+
+```bash
+# 单侧有链：归并后别名与目标 ID 查询等价
+curl -s http://localhost:8000/exhibits/OLD-SRC-ID/area-handovers   # 别名
+curl -s http://localhost:8000/exhibits/NEW-TGT-ID/area-handovers   # 目标
+# 两者 history 完全一致
+
+# 双侧有链：
+# POST /merges/commit → 409
+# {"detail": "来源档案 OLD-SRC-ID 与目标档案 NEW-TGT-ID 都存在跨轮区域交接链（分别为 2 笔与 1 笔），归并被拒绝且不改动任何交接记录：…"}
+```
 
 ## 展品应急撤离编排
 

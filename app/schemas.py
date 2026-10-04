@@ -435,6 +435,19 @@ class MergePreviewOut(BaseModel):
         description="双方都已配置来源优先级版本且内容不一致：归并提交将被拒绝（409），"
                     "冲突不会静默覆盖；仅一方配置或双方一致时自动合并",
     )
+    source_handover_count: int = Field(
+        default=0,
+        description="来源档案已固化的跨轮区域交接笔数",
+    )
+    target_handover_count: int = Field(
+        default=0,
+        description="目标档案已固化的跨轮区域交接笔数",
+    )
+    area_handover_conflict: bool = Field(
+        default=False,
+        description="双方都存在跨轮区域交接链：归并提交将被拒绝（409），"
+                    "不改动任何交接记录；仅单侧有链时归并后整链以目标 ID 或别名可查",
+    )
     ready_to_commit: bool = Field(description="是否不存在待裁决冲突（true 才可提交）")
 
 
@@ -481,6 +494,11 @@ class MergeCommitOut(BaseModel):
         default_factory=list,
         description="归并后原样保留的存证收据链标识（来源与目标的既有链），"
                     "可用 GET /receipts/chains/{chain_id}/verify 分别校验",
+    )
+    handover_chain_carried: bool = Field(
+        default=False,
+        description="true 表示单侧已有的跨轮区域交接链已整链改挂到目标规范档案，"
+                    "归并后用目标 ID 或来源别名均可查询同一条链",
     )
     already_committed: bool = Field(description="true 表示本次为同令牌重放，返回的是首次提交结果")
 
@@ -1187,4 +1205,57 @@ class ComplianceCheckOut(BaseModel):
         default=False,
         description="true 表示相同 request_key 且规范化输入与当时摘要一致的重放，"
                     "返回的是首次固化的凭证",
+    )
+
+
+# ---------- 跨盘点轮次的馆藏区域交接 ----------
+
+class AreaHandoverRequest(BaseModel):
+    """跨盘点轮次的馆藏区域交接请求。"""
+
+    exhibit_id: str = Field(min_length=1, max_length=200,
+                            description="交接展品 ID 或归并别名；提交时解析为规范档案")
+    source_round_id: str = Field(min_length=1, max_length=200,
+                                 description="来源盘点轮次 ID（须已固化对账）")
+    target_round_id: str = Field(min_length=1, max_length=200,
+                                 description="接收盘点轮次 ID（须已固化对账，且起始时间晚于来源轮）")
+    source_area: str = Field(min_length=1, max_length=100,
+                             description="展品在来源轮中明确定位的区域（须与该轮预期/定位一致）")
+    target_area: str = Field(min_length=1, max_length=100,
+                             description="展品在接收轮中明确定位的区域（须与该轮预期/定位一致）")
+
+
+class AreaHandoverOut(BaseModel):
+    """一笔已固化的跨轮区域交接（交接链中的一环）。"""
+
+    seq: int = Field(description="交接链内序号，从 1 连续递增；链按盘点轮次时间向前续接")
+    source_round_id: str
+    target_round_id: str
+    source_area: str = Field(description="来源轮明确定位的区域（交接证据）")
+    target_area: str = Field(description="接收轮明确定位的区域（交接证据）")
+    source_round_start_at: str = Field(description="来源轮盘点起始时刻（UTC，ISO 8601，Z 结尾）")
+    target_round_start_at: str = Field(description="接收轮盘点起始时刻（UTC，ISO 8601，Z 结尾）")
+    source_round_digest: str = Field(description="来源轮固化时绑定的规范化请求摘要（SHA-256）")
+    target_round_digest: str = Field(description="接收轮固化时绑定的规范化请求摘要（SHA-256）")
+    created_at: str = Field(description="交接固化时刻（UTC，ISO 8601，Z 结尾）")
+
+
+class AreaHandoverResponse(AreaHandoverOut):
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="别名解析后的规范档案 ID")
+
+
+class AreaHandoverChainOut(BaseModel):
+    """展品当前区域与按轮次时间排序的交接历史。"""
+
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="别名解析后的规范档案 ID")
+    current_round_id: str | None = Field(
+        description="当前去向所在的接收轮 ID；从未交接为 null",
+    )
+    current_area: str | None = Field(
+        description="当前区域（最后一笔交接的接收轮定位区域）；从未交接为 null",
+    )
+    history: list[AreaHandoverOut] = Field(
+        description="交接历史，按交接序号（= 盘点轮次时间）升序；首次交接以来源轮建链",
     )

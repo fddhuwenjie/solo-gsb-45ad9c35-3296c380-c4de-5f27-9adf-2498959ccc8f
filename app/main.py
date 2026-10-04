@@ -32,6 +32,7 @@ from .db import get_conn, init_db
 from .diagnose import build_events, intersect_window, sort_events
 from .dose import compute_dose
 from .evacuation import EvacuationGraph, EvacuationGraphError, plan_evacuation
+from .handovers import create_handover, load_handover_chain
 from .inventory import load_round, reconcile_round
 from .merge import commit_merge, create_preview, get_canonical_or_404, resolve_canonical
 from .receipts import (
@@ -41,6 +42,9 @@ from .receipts import (
     verify_chain_rows,
 )
 from .schemas import (
+    AreaHandoverChainOut,
+    AreaHandoverRequest,
+    AreaHandoverResponse,
     CalendarConfigIn,
     CalendarExceptionDayOut,
     CalendarOut,
@@ -117,7 +121,7 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.11.0",
+    version="1.12.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
@@ -153,7 +157,14 @@ app = FastAPI(
                 "支持展厅开放批次合规核验：单个写事务内解析别名、读取盘点轮次固化结果、"
                 "逐件重算截至窗口末的 calendar=display 剂量与完整诊断事件、检查未结处置单；"
                 "全部通过才固化含各项证据摘要的合规凭证，任一失败逐件返回原因且不写入；"
-                "request_key 仅在规范化输入与当时摘要一致时重放，否则 409。",
+                "request_key 仅在规范化输入与当时摘要一致时重放，否则 409。"
+                "支持跨盘点轮次的馆藏区域交接：两轮须已固化且起始时间递增，"
+                "展品须列在两轮预期清单并在各轮明确定位于所报区域"
+                "（缺失/错位/位置不明不得交接）；首次以来源轮建链，"
+                "此后只能从上一笔接收轮与区域续接、旧轮不能回填覆盖当前去向；"
+                "核验证据与写入在同一写事务内完成，并发最多一笔生效、不留半笔；"
+                "固化两轮摘要，提供当前区域与按轮次时间排序的交接历史；"
+                "归并单侧有链整链改挂到目标（目标 ID 或别名可查），双侧有链拒绝归并。",
     lifespan=lifespan,
 )
 
@@ -1198,6 +1209,64 @@ def get_inventory_round(
     if result is None:
         raise HTTPException(status_code=404, detail=f"盘点轮次不存在或尚未对账: {round_id}")
     return result
+
+
+# ---------- 跨盘点轮次的馆藏区域交接 ----------
+
+@app.post("/exhibits/{exhibit_id}/area-handovers",
+          response_model=AreaHandoverResponse, status_code=201,
+          tags=["area-handovers"])
+def submit_area_handover(
+    exhibit_id: str,
+    payload: AreaHandoverRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AreaHandoverResponse:
+    """提交一笔跨盘点轮次的馆藏区域交接并固化。
+
+    - 路径展品 ID 与请求体 ``exhibit_id`` 都可用归并别名（解析后须为同一
+      规范档案）；提交来源轮 ``source_round_id``、接收轮 ``target_round_id``
+      与两端区域 ``source_area`` / ``target_area``；
+    - 两轮都必须已固化对账（未对账 → 404），且接收轮起始时间**严格晚于**
+      来源轮（起始时间不递增 → 422）；
+    - 展品必须同时列在两轮的预期清单中，并在各轮**明确定位到所报区域**：
+      缺失、错位、位置不明或未列入预期 → **409 不得交接**；
+    - **首次交接以来源轮建链**；此后只能从上一笔交接的**接收轮与接收区域**
+      续接，旧轮次不能回填、不能覆盖当前去向（违反 → 409）；
+    - 证据核验与写入在**同一个 SQLite 写事务**（BEGIN IMMEDIATE）内完成，
+      并发交接最多一笔生效（竞争方 409），失败不留下半笔记录；每笔交接
+      固化两轮的请求摘要作为证据。
+    """
+    # 路径 ID 与体 ID 是同一展品的两种写法：解析为同一规范档案才接受，
+    # 防止路径用 A、请求体却把交接记到 B。
+    path_canonical = resolve_canonical(conn, exhibit_id)
+    if path_canonical is None:
+        raise HTTPException(status_code=404, detail=f"展品不存在: {exhibit_id}")
+    body_canonical = resolve_canonical(conn, payload.exhibit_id)
+    if body_canonical is None:
+        raise HTTPException(status_code=404, detail=f"展品不存在: {payload.exhibit_id}")
+    if path_canonical != body_canonical:
+        raise HTTPException(
+            status_code=422,
+            detail=f"路径展品 {exhibit_id}（规范档案 {path_canonical}）与请求体 "
+                   f"exhibit_id {payload.exhibit_id}（规范档案 {body_canonical}）"
+                   "不是同一档案",
+        )
+    return create_handover(conn, payload)
+
+
+@app.get("/exhibits/{exhibit_id}/area-handovers",
+         response_model=AreaHandoverChainOut, tags=["area-handovers"])
+def get_area_handovers(
+    exhibit_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AreaHandoverChainOut:
+    """读取展品当前区域与按轮次时间排序的交接历史；别名（含归并后来源 ID）
+    自动解析到规范档案；从未交接时 ``current_area`` 为 null、``history`` 为空。
+    """
+    out = load_handover_chain(conn, exhibit_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail=f"展品不存在: {exhibit_id}")
+    return out
 
 
 # ---------- 展品应急撤离编排（纯只读计算） ----------

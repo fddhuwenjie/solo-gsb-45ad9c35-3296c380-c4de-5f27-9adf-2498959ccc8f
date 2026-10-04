@@ -48,9 +48,30 @@ def to_iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _handover_fingerprint(conn: sqlite3.Connection, canonical_id: str) -> list:
+    """档案跨轮区域交接链的指纹：整链逐环（含轮次摘要与区域）按序号排列。
+
+    交接链只增不改，指纹纳入归并预演的元数据版本：预演后任一侧新增
+    交接都会使令牌失效（提交 409），保证“单侧有链改挂 / 双侧有链拒绝”
+    的判定基于与预演一致的状态。直接查表（而非导入 handovers 模块），
+    避免顶层导入环。
+    """
+    rows = conn.execute(
+        "SELECT seq, source_round_id, target_round_id, source_area, target_area, "
+        "source_round_digest, target_round_digest FROM area_handovers "
+        "WHERE canonical_id = ? ORDER BY seq ASC",
+        (canonical_id,),
+    ).fetchall()
+    return [
+        [r["seq"], r["source_round_id"], r["target_round_id"], r["source_area"],
+         r["target_area"], r["source_round_digest"], r["target_round_digest"]]
+        for r in rows
+    ]
+
+
 def _meta_hash(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     # 来源优先级配置同样属于档案元数据版本：预演后发布新版本（或配置被合并）
-    # 都会使令牌失效，归并提交 409。
+    # 都会使令牌失效，归并提交 409。跨轮交接链同理：预演后新增交接也使令牌失效。
     payload = {
         "id": row["id"],
         "name": row["name"],
@@ -60,14 +81,14 @@ def _meta_hash(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
         "source_priority": versions_fingerprint(
             load_priority_versions(conn, row["id"])
         ),
+        "area_handovers": _handover_fingerprint(conn, row["id"]),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
 
-def _readings_hash(rows: list[sqlite3.Row]) -> str:
-    # 作废标记与来源标识同样是读数集合版本的一部分：预演后发生批次更正（作废）
+def _readings_hash(rows: list[sqlite3.Row]) -> str:    # 作废标记与来源标识同样是读数集合版本的一部分：预演后发生批次更正（作废）
     # 或读数来源变化也使令牌失效。旧库迁移前列可能缺失，用 row.keys() 兜底。
     cols = rows[0].keys() if rows else ()
     payload = [
@@ -219,6 +240,15 @@ def create_preview(conn: sqlite3.Connection, requested_source: str,
                 target=_versions_brief(tgt_versions),
             )
 
+    # 跨轮区域交接链：双侧都有链时拒绝归并（提交将 409），单侧有链时
+    # 提交把整链改挂到目标，归并后用目标 ID 或来源别名都能查到同一条链。
+    # 惰性导入 handovers：该模块反向导入本模块，顶层互导会形成环。
+    from .handovers import handover_counts
+
+    ho_counts = handover_counts(conn, source_id, target_id)
+    src_ho_count, tgt_ho_count = ho_counts[source_id], ho_counts[target_id]
+    handover_conflict = src_ho_count > 0 and tgt_ho_count > 0
+
     source_only = len(src_map) - len(collisions)
 
     token = uuid.uuid4().hex
@@ -250,7 +280,10 @@ def create_preview(conn: sqlite3.Connection, requested_source: str,
         conflict_count=conflicts,
         source_only_count=source_only,
         source_priority_conflict=priority_conflict,
-        ready_to_commit=conflicts == 0 and not priority_conflict,
+        source_handover_count=src_ho_count,
+        target_handover_count=tgt_ho_count,
+        area_handover_conflict=handover_conflict,
+        ready_to_commit=conflicts == 0 and not priority_conflict and not handover_conflict,
     )
 
 
@@ -266,6 +299,10 @@ class _ChainBroken(Exception):
 
 class _PriorityConflict(Exception):
     """双方来源优先级配置不一致，归并必须 409 拒绝（冲突不静默覆盖）。"""
+
+
+class _HandoverChainConflict(Exception):
+    """双方都存在跨轮区域交接链，归并必须 409 拒绝，不改动任何交接记录。"""
 
 
 class _CommitValidation(Exception):
@@ -395,6 +432,19 @@ def commit_merge(conn: sqlite3.Connection, token: str,
                      json.dumps(v.priorities, ensure_ascii=False), v.created_at),
                 )
 
+        # 跨轮区域交接链：双方都有链 → 409 拒绝归并且不改动任何记录
+        # （两条链无法在不丢失“当前去向”语义的前提下合并）。单侧有链时，
+        # 待来源删除、别名落库后把来源链整链改挂到目标（见下方 rebind）。
+        from .handovers import handover_counts, rebind_handover_chain
+
+        ho_counts = handover_counts(conn, source_id, target_id)
+        if ho_counts[source_id] > 0 and ho_counts[target_id] > 0:
+            raise _HandoverChainConflict(
+                f"来源档案 {source_id} 与目标档案 {target_id} 都存在跨轮区域交接链"
+                f"（分别为 {ho_counts[source_id]} 笔与 {ho_counts[target_id]} 笔），"
+                "归并被拒绝且不改动任何交接记录：请先确认以哪条链为准"
+            )
+
         src_map = {r["reading_id"]: r for r in src_rows}
         tgt_map = {r["reading_id"]: r for r in tgt_rows}
         shared = src_map.keys() & tgt_map.keys()
@@ -471,6 +521,10 @@ def commit_merge(conn: sqlite3.Connection, token: str,
             "INSERT INTO exhibit_aliases (alias_id, canonical_id) VALUES (?, ?)",
             (source_id, target_id),
         )
+        # 3b) 单侧已有交接链：整链改挂到目标（序号与证据行不变）。
+        #     必须在删除来源档案之前完成——交接链对 exhibits 是
+        #     ON DELETE RESTRICT，且改挂后不再有行指向即将删除的来源。
+        carried_handovers = rebind_handover_chain(conn, source_id, target_id)
         # 4) 删除来源档案读数与来源档案本身（须在别名落库之后）
         conn.execute("DELETE FROM readings WHERE exhibit_id = ?", (source_id,))
         conn.execute("DELETE FROM exhibits WHERE id = ?", (source_id,))
@@ -500,6 +554,7 @@ def commit_merge(conn: sqlite3.Connection, token: str,
             final_reading_count=final_count,
             aliases=aliases,
             receipt_chains=receipt_chains,
+            handover_chain_carried=carried_handovers > 0,
             already_committed=False,
         )
         # 5) 固化结果供同令牌重放；先写结果再置 committed_at
@@ -519,6 +574,9 @@ def commit_merge(conn: sqlite3.Connection, token: str,
         conn.rollback()
         raise HTTPException(status_code=409, detail=str(e))
     except _PriorityConflict as e:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail=str(e))
+    except _HandoverChainConflict as e:
         conn.rollback()
         raise HTTPException(status_code=409, detail=str(e))
     except _CommitValidation as e:
